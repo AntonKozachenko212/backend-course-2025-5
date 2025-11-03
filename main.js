@@ -15,6 +15,7 @@ program.parse(process.argv);
 
 const opts = program.opts();
 const CACHE_DIR = path.resolve(opts.cache);
+const CAT_URL = 'https://http.cat/';
 
 async function ensureCacheDir() {
   try {
@@ -46,10 +47,26 @@ function sendPlain(res, status, text) {
   res.end(text + '\n');
 }
 
+async function getCat(code) {
+  const url = `${CAT_URL}${code}.jpg`;
+  const resp = await superagent
+    .get(url)
+    .responseType('blob')
+    .ok(res => res.status < 500);
+  
+  if (resp.status === 404) {
+    const err = new Error('Not Found at http.cat');
+    err.code = 'HTTP_CAT_404';
+    throw err;
+  }
+  
+  return Buffer.from(resp.body);
+}
+
 const server = http.createServer(async (req, res) => {
   const code = (req.url || '/').replace(/^\//, '').split('/')[0];
   if (!/^\d{3}$/.test(code)) {
-    sendPlain(res, 404, 'Not Found');
+    send404(res);
     return;
   }
 
@@ -59,24 +76,47 @@ const server = http.createServer(async (req, res) => {
     try {
       const data = await fs.readFile(filename);
       sendImageBuffer(res, data);
+      return;
     } catch (err) {
-      if (err.code === 'ENOENT') {
-        sendPlain(res, 404, 'Not Found');
-      } else {
-        sendPlain(res, 500, 'Internal Server Error');
+      if (err.code !== 'ENOENT') {
+        console.error('Cache read error', err);
+        return sendPlain(res, 500, 'Internal Server Error');
+      }
+      
+      try {
+        console.log(`Cache miss for ${code}, fetching from ${CAT_URL}`);
+        const imgBuf = await getCat(code);
+        
+        try {
+          await fs.writeFile(filename, imgBuf);
+          console.log(`Saved ${filename}`);
+        } catch (werr) {
+          console.error('Failed to write cache file', werr);
+        }
+        
+        sendImageBuffer(res, imgBuf);
+        return;
+      } catch (fetchErr) {
+        if (fetchErr.code === 'HTTP_CAT_404' || fetchErr.status === 404) {
+          return send404(res);
+        }
+        console.error('Fetch error', fetchErr);
+        return sendPlain(res, 500, 'Internal Server Error');
       }
     }
-    return;
   }
 
   if (req.method === 'PUT') {
-    // читає реквест у тіло
     try {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = Buffer.concat(chunks);
+      
+      if (body.length === 0) {
+        return sendPlain(res, 400, 'Bad Request - Empty body');
+      }
+      
       await fs.writeFile(filename, body);
-      // Return 201 Created
       sendPlain(res, 201, 'Created');
     } catch (err) {
       console.error('PUT error', err);
@@ -91,16 +131,16 @@ const server = http.createServer(async (req, res) => {
       sendPlain(res, 200, 'OK');
     } catch (err) {
       if (err.code === 'ENOENT') {
-        sendPlain(res, 404, 'Not Found');
+        send404(res);
       } else {
+        console.error('DELETE error', err);
         sendPlain(res, 500, 'Internal Server Error');
       }
     }
     return;
   }
 
-  //якщо невизначений метод
-  sendPlain(res, 405, 'Method Not Allowed');
+  send405(res);
 });
 
 (async () => {
